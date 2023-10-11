@@ -467,7 +467,7 @@ function write(io::IO, tbl)
     fields = [FieldDescriptor(k, v) for (k,v) in pairs(getfield(dct, :values))]
     records = UInt32(length(first(dct)))
     fieldcolumns = Dict{Symbol,Int}(f.name => i for (i,f) in enumerate(fields))
-    hsize = UInt16(length(fields) * 32 + 32)
+    hsize = UInt16(length(fields) * 32 + 32) + 1 # +1 for the 0x0D delimiter
     rsize = UInt16(sum(x -> x.length, fields)) + 1
 
     version = 0x03
