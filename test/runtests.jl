@@ -15,7 +15,7 @@ row, st = iterate(dbf)
             all(ismissing(a) ? ismissing(b) : a == b for (a,b) in zip(t1,t2))
         end
         function _roundtrip(table)
-            file = joinpath(tempdir(), "test.dbf")
+            file = joinpath(@__DIR__, "test_$(rand(1:10)).dbf")
             DBFTables.write(file, table)
             table2 = DBFTables.Table(file)
         end

@@ -4,27 +4,49 @@ import Tables, WeakRefStrings
 using Dates
 using Printf: @sprintf
 
+"""
+Base type of all DBF file format versions
+"""
+abstract type AbstractVersion end
+
+struct DBASE3 <: AbstractVersion end # http://www.dbase.com/Knowledgebase/INT/db7_file_fmt.htm
+struct DBASE7 <: AbstractVersion end # https://wiki.dbfmanager.com/dbf-structure
+
+function Version(version_id::UInt8)
+    if version_id == 0x03
+        return DBASE3()
+    else
+        error("As of yet unsupported version: $(version_string(version_id))")
+    end
+end
+
 "Field/column descriptor, part of the Header"
 struct FieldDescriptor
     name::Symbol
     type::Type
-    dbf_type::Char
-    length::UInt8
+    dbf_type::Char # single letter type. Obtained by calling `dbf_type(::Type)` of a Julia type
+    length::UInt8 # length in bytes
     ndec::UInt8
 end
 
-"Create FieldDescriptor from a column in a Tables.jl table."
+"Create FieldDescriptor from a column in a Tables.jl table provided as `data`."
 function FieldDescriptor(name::Symbol, data::AbstractVector)
     T = Base.nonmissingtype(eltype(data))
     char = dbf_type(T)
     ndec = 0x00
     itr = skipmissing(data)
-    if char === 'D'
+
+    if char === 'D' # date
         len = 0x08
     elseif T === Union{}  # data is only missings
         len = 0x01
     elseif char === 'C'
-        width = T <: AbstractString ? maximum(length, itr) : maximum(x -> length(string(x)), itr)
+        is_abstract_string = T <: AbstractString
+        # # does not happen
+        # if !is_abstract_string
+        #     @warn "Column $name is of type 'C' but not an abstract string" 
+        # end
+        width = is_abstract_string ? maximum(length, itr) : maximum(x -> length(string(x)), itr) # TODO: What about the string delimiter?
         if width > 254
             @warn "Due to DBF limitations, strings in field $name will be truncated to 254 characters."
             len = UInt8(254)
@@ -36,6 +58,10 @@ function FieldDescriptor(name::Symbol, data::AbstractVector)
         ndec = T <: AbstractFloat ? 0x1 : 0x0
     elseif char === 'L'
         len = 0x1
+    elseif char === 'Y'
+        error("FIeld type Currency not yet supported")
+    elseif char === 'T'
+        error("FIeld type DateTime not yet supported")
     else
         error("This shouldn't be reachable.  Unknown DBF type code: '$char'.")
     end
@@ -44,11 +70,11 @@ end
 
 "DBF header, which also holds all field definitions"
 struct Header
-    version::UInt8
+    version::UInt8  # DBF version used to save file
     last_update::Date
-    records::UInt32
-    hsize::UInt16
-    rsize::UInt16
+    records::UInt32 # number of records
+    hsize::UInt16 # header size in bytes
+    rsize::UInt16 # record size in bytes
     incomplete::Bool
     encrypted::Bool
     mdx::Bool
@@ -78,6 +104,7 @@ dbf_type(::Type{Bool}) = 'L'
 dbf_type(::Type{<:Integer}) = 'N'
 dbf_type(::Type{<:AbstractFloat}) = 'N'
 dbf_type(::Type{Date}) = 'D'
+# dbf_type(::Type{DateTime}) = 'T'  # TODO: Not yet supported
 dbf_type(::Type{Union{}}) = 'C'
 function dbf_type(::Type{T}) where {T}
     @warn "No DBF type associated with Julia type $T.  Data will be saved as `string(x)`."
@@ -94,7 +121,7 @@ end
 dbf_value(::Val{'C'}, len::UInt8, ::Missing) = ' ' ^ len
 
 # Bool
-dbf_value(::Val{'L'}, ::UInt8, x::Bool) = x ? 'T' : 'F'
+dbf_value(::Val{'L'}, ::UInt8, x::Bool) = x ? 'T' : 'F' # logical T (true) or F (false)
 dbf_value(::Val{'L'}, ::UInt8, ::Missing) = '?'
 
 # Integer
@@ -190,6 +217,14 @@ function julia_value(::Type{Bool}, ::Val{'L'}, s::AbstractString)
     end
 end
 
+"""
+    read_dbf_field(io::IO, version::AbstractVersion)
+
+Read a field descriptor from the stream, and create a [`FieldDescriptor`](@ref) struct.
+
+Format: See https://wiki.dbfmanager.com/dbf-structure
+"""
+function read_dbf_field(io::IO, version::DBASE3)
     # Field name with a maximum of 10 characters. If less than 10, it is padded with null characters (0x00). 
     field_name_raw = String(read!(io, Vector{UInt8}(undef, 11)))
     field_name = Symbol(split(field_name_raw, '\0')[1])
@@ -216,30 +251,72 @@ function Base.write(io::IO, fd::FieldDescriptor)
     return out
 end
 
-"Read a DBF header from a stream"
+"""
+    version(ver::UInt8)::String
+
+Returns the DBF version of the header based on the integer value.
+Based on https://wiki.dbfmanager.com/dbf-structure
+"""
+function version_string(ver::UInt8)::String
+    version_strings = Dict{UInt8,String}(
+        0x02 => "FoxBASE",
+        0x03 => "FoxBASE+/Dbase III plus, no memo",
+        0x30 => "Visual FoxPro",
+        0x31 => "Visual FoxPro, autoincrement enabled",
+        0x32 => "Visual FoxPro, Varchar, Varbinary, or Blob-enabled",
+        0x43 => "dBASE IV SQL table files, no memo",
+        0x63 => "dBASE IV SQL system files, no memo",
+        0x83 => "FoxBASE+/dBASE III PLUS, with memo",
+        0x8B => "dBASE IV with memo",
+        0xCB => "dBASE IV SQL table files, with memo",
+        0xF5 => "FoxPro 2.x (or earlier) with memo",
+        0xFB => "FoxBASE",
+    )
+    return get(version_strings, ver, "Unknown")
+end
+
+const HEADER_RECORD_TERMINATOR = 0x0D
+
+"""
+    Header(io::IO)
+
+Read a DBF header from a stream.
+
+The header structure can be found here: http://www.dbase.com/Knowledgebase/INT/db7_file_fmt.htm
+https://wiki.dbfmanager.com/dbf-structure
+"""
 function Header(io::IO)
     ver = read(io, UInt8)
+    @info "Read header for version $(version_string(ver))"
+    version = Version(ver)
     yy = read(io, UInt8)
     mm = read(io, UInt8)
     dd = read(io, UInt8)
     last_update = Date(yy + 1900, mm, dd)
+    @info "Last update: $last_update"
     records = read(io, UInt32)
+    @info "Number of records/rows: $records"
     hsize = read(io, UInt16)
     rsize = read(io, UInt16)
+    @info "Record size: $rsize"
     skip(io, 2)  # reserved
     incomplete = Bool(read(io, UInt8))
     encrypted = Bool(read(io, UInt8))
     skip(io, 12)  # reserved
-    mdx = Bool(read(io, UInt8))
-    lang_id = read(io, UInt8)
+    mdx = Bool(read(io, UInt8)) # whether an .MDX file exists for this table (0x01) or not (0x00). OR: Table flags: 0x01 file has a structural .cdx,  0x02 file has a Memo field,  0x04 file is a database (.dbc).  This byte can contain the sum of any of the above values. For example, the value 0x03 indicates the table has a structural .cdx and a Memo field. 
+    @info "MDF: $mdx"
+    lang_id = read(io, UInt8) # "Code page mark" according to https://wiki.dbfmanager.com/dbf-structure
+    @info "Language driver: $lang_id"
     skip(io, 2)  # reserved
+    # now, according to http://www.dbase.com/Knowledgebase/INT/db7_file_fmt.htm, there should be a 32 bytes language driver name
+
     fields = FieldDescriptor[]
 
     # use Dict for quicker column index lookup
     fieldcolumns = Dict{Symbol,Int}()
     col = 1
     while !eof(io)
-        field = read_dbf_field(io)
+        field = read_dbf_field(io, version)
         fieldcolumns[field.name] = col
         push!(fields, field)
         col += 1
@@ -344,10 +421,10 @@ function Table(path::AbstractString)
 end
 
 "Collect all the offsets and lengths from the header to create a StringArray"
-function _create_stringarray(header::Header, data::AbstractVector)
+function _create_stringarray(header::Header, data::Vector{UInt8})
     # first make the lengths and offsets for a single record
     lengths_record = UInt32.(getfield.(header.fields, :length))
-    offsets_record = vcat(0, cumsum(lengths_record)[1:end-1]) .+ 1
+    offsets_record = vcat(0, cumsum(lengths_record)[1:end-1]) .+ 1 # there should be no offset. It was at .+ 1; if worked for me for .+ 2
 
     # the lengths are equal for each record
     lengths = repeat(lengths_record, 1, header.records)
