@@ -11,11 +11,12 @@ row, st = iterate(dbf)
 
 @testset "DBFTables" begin
     @testset "Writing" begin
+        itr = 1
         tables_equal(tbl1, tbl2) = all(zip(Tables.columns(tbl1), Tables.columns(tbl2))) do (t1, t2)
             all(ismissing(a) ? ismissing(b) : a == b for (a,b) in zip(t1,t2))
         end
         function _roundtrip(table)
-            file = joinpath(@__DIR__, "test_$(rand(1:10)).dbf")
+            file = joinpath(@__DIR__, "test_$itr.dbf"); itr += 1;
             DBFTables.write(file, table)
             table2 = DBFTables.Table(file)
         end
