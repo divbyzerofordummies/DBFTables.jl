@@ -323,9 +323,16 @@ or to retrieve columns like `dbf.fieldname`.
 """
 function Table(io::IO)
     header = Header(io)
-    # consider using mmap here for big dbf files
+    # TODO: consider using mmap here for big dbf files
+
+    # Make sure data is read at the right position
+    bytes_to_skip = header.hsize - position(io)
+    # @info "Bytes to skip: $bytes_to_skip (header size: $(header.hsize), position: $(position(io))"
+    bytes_to_skip > 0 && skip(io, bytes_to_skip)
+
     data = Vector{UInt8}(undef, header.rsize * header.records)
     read!(io, data)
+    
     strings = _create_stringarray(header, data)
     Table(header, data, strings)
 end
